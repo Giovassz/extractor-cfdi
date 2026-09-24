@@ -1,17 +1,26 @@
-import io
+import os
 import time
+from datetime import datetime
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
+from google.cloud import bigquery
 from dotenv import load_dotenv
+
 from app.schemas.invoice import InvoiceData
+from app.services.security import generate_sha256_hash, mask_sensitive_rfc
 
 load_dotenv()
 
-app = FastAPI(title="CFDI Extractor API", version="1.0.0")
+app = FastAPI(title="CFDI Extractor API - Secures", version="1.0.0")
+
 client = genai.Client()
+
+PROJECT_ID = os.getenv("GCP_PROJECT_ID", "extractor-cfdi-23198")
+bq_client = bigquery.Client(project=PROJECT_ID)
+TABLE_ID = f"{PROJECT_ID}.fiscal_data.invoices"
 
 MODEL_NAME = 'gemini-3.6-flash'
 
@@ -23,16 +32,40 @@ Eres un contador público y auditor fiscal experto en comprobantes fiscales mexi
 Tu objetivo es analizar el documento adjunto y extraer la información financiera con precisión matemática.
 
 REGLAS STRICTAS DE MONTO Y CONCEPTOS:
-1. 'subtotal': Corresponde al valor antes de impuestos de la suma de los conceptos/servicios (Ejemplo: si la suma es 5000.00, pon 5000.0).
-2. 'iva_amount': Corresponde únicamente al impuesto trasladado IVA (Ejemplo: si el IVA es 800.00, pon 800.0).
+1. 'subtotal': Corresponde al valor antes de impuestos de la suma de los conceptos/servicios.
+2. 'iva_amount': Corresponde únicamente al impuesto trasladado IVA.
 3. 'total': Corresponde a la suma total a pagar (subtotal + IVA).
 4. Para cada ítem en 'items':
    - 'quantity': Cantidad prestada/comprada.
    - 'description': Descripción completa del servicio o concepto.
    - 'unit_price': Precio por unidad antes de impuestos.
-   - 'amount': Importe total del concepto (quantity * unit_price).
-5. NUNCA asignes 0.0 al subtotal ni al unit_price si hay montos visibles en el documento.
+   - 'amount': Importe total del concepto.
 """
+
+def save_to_bigquery_secure(invoice: InvoiceData, file_hash: str):
+    """Inserta la factura en BigQuery aplicando enmascaramiento de PII y hash de seguridad."""
+    
+    # Enmascarar datos sensibles (PII) antes de guardar
+    masked_rfc_receiver = mask_sensitive_rfc(invoice.rfc_receiver)
+
+    rows_to_insert = [
+        {
+            "rfc_issuer": invoice.rfc_issuer,
+            "name_issuer": invoice.name_issuer,
+            "rfc_receiver": masked_rfc_receiver, # Guardado seguro
+            "name_receiver": invoice.name_receiver,
+            "invoice_date": invoice.invoice_date,
+            "currency": invoice.currency,
+            "subtotal": invoice.subtotal,
+            "total": invoice.total,
+            "processed_at": datetime.utcnow().isoformat(),
+        }
+    ]
+    errors = bq_client.insert_rows_json(TABLE_ID, rows_to_insert)
+    if errors:
+        print(f"⚠️ Error insertando en BigQuery: {errors}")
+    else:
+        print(f"🔒 Registro guardado de forma segura en BQ (SHA256: {file_hash[:10]}...).")
 
 def generate_with_retry(prompt: str, contents: list = None, max_retries: int = 5) -> str:
     full_prompt = f"{SYSTEM_INSTRUCTION}\n\n{prompt}"
@@ -41,10 +74,8 @@ def generate_with_retry(prompt: str, contents: list = None, max_retries: int = 5
         payload.extend(contents)
 
     last_error = None
-
     for attempt in range(max_retries):
         try:
-            print(f"Enviando petición a {MODEL_NAME} (intento {attempt + 1}/{max_retries})...")
             response = client.models.generate_content(
                 model=MODEL_NAME,
                 contents=payload,
@@ -57,47 +88,42 @@ def generate_with_retry(prompt: str, contents: list = None, max_retries: int = 5
             return response.text
         except APIError as e:
             last_error = e
-            print(f"APIError ({e.code}): {e.message}")
-            
-            # Si la API nos limita por cuotas (429), saturación (503) o error temporal (500)
             if e.code in (429, 503, 500) and attempt < max_retries - 1:
-                # Tiempo de espera progresivo: 4s, 7s, 11s, 16s...
-                wait_time = 4 + (attempt * 3)
-                print(f"Cuota/Saturación detectada. Esperando {wait_time} segundos antes de reintentar...")
-                time.sleep(wait_time)
+                time.sleep(4 + attempt * 3)
                 continue
-            
             raise e
         except Exception as e:
             last_error = e
             break
 
-    raise HTTPException(
-        status_code=503, 
-        detail=f"Servicio saturado o cuota excedida temporalmente: {str(last_error)}"
-    )
+    raise HTTPException(status_code=503, detail=f"Servicio no disponible: {str(last_error)}")
 
 @app.get("/")
 def read_root():
-    return {"status": "online", "service": "CFDI Extractor"}
-
-@app.post("/extract", response_model=InvoiceData)
-def extract_invoice_data(request: ExtractRequest):
-    prompt = f"Extrae la información fiscal estructurada del siguiente texto de factura:\n\n{request.raw_text}"
-    json_response = generate_with_retry(prompt)
-    return InvoiceData.model_validate_json(json_response)
+    return {"status": "online", "service": "CFDI Extractor con Seguridad PII"}
 
 @app.post("/extract-file", response_model=InvoiceData)
 async def extract_invoice_file(file: UploadFile = File(...)):
     try:
         contents = await file.read()
+        
+        # 1. Generar Hash SHA-256 de seguridad e integridad
+        file_hash = generate_sha256_hash(contents)
+
         mime_type = file.content_type or "application/pdf"
         file_part = types.Part.from_bytes(data=contents, mime_type=mime_type)
         
-        prompt = "Analiza directamente la imagen/documento adjunto de la factura. Revisa minuciosamente la tabla de conceptos y desglose de subtotales/impuestos para extraer la información estructurada."
-        
+        prompt = "Analiza directamente la imagen/documento adjunto de la factura y extrae la información fiscal estructurada."
         json_response = generate_with_retry(prompt, contents=[file_part])
-        return InvoiceData.model_validate_json(json_response)
+        data = InvoiceData.model_validate_json(json_response)
+        
+        # 2. Persistencia en BigQuery con protección PII
+        try:
+            save_to_bigquery_secure(data, file_hash)
+        except Exception as err:
+            print(f"Error BQ: {err}")
+
+        return data
 
     except HTTPException:
         raise
